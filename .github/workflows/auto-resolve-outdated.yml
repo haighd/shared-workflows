@@ -29,33 +29,43 @@ jobs:
           script: |
             const prNumber = ${{ inputs.pr_number }};
 
-            const query = `query($owner: String!, $repo: String!, $pr: Int!) {
-              repository(owner: $owner, name: $repo) {
-                pullRequest(number: $pr) {
-                  reviewThreads(first: 100) {
-                    nodes {
-                      id
-                      isResolved
-                      isOutdated
-                      comments(first: 1) {
-                        nodes {
-                          body
-                          author { login }
+            // Paginate reviewThreads
+            let threads = [];
+            let hasNextPage = true;
+            let cursor = null;
+            while (hasNextPage) {
+              const cursorArg = cursor ? `, after: "${cursor}"` : '';
+              const query = `query($owner: String!, $repo: String!, $pr: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100${cursorArg}) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        id
+                        isResolved
+                        isOutdated
+                        comments(first: 1) {
+                          nodes {
+                            body
+                            author { login }
+                          }
                         }
                       }
                     }
                   }
                 }
-              }
-            }`;
+              }`;
+              const result = await github.graphql(query, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pr: prNumber
+              });
+              const page = result.repository.pullRequest.reviewThreads;
+              threads = threads.concat(page.nodes);
+              hasNextPage = page.pageInfo.hasNextPage;
+              cursor = page.pageInfo.endCursor;
+            }
 
-            const result = await github.graphql(query, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pr: prNumber
-            });
-
-            const threads = result.repository.pullRequest.reviewThreads.nodes;
             const outdatedUnresolved = threads.filter(t => t.isOutdated && !t.isResolved);
 
             if (outdatedUnresolved.length === 0) {
