@@ -1,0 +1,105 @@
+name: Auto-Resolve Outdated Threads
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: number
+    outputs:
+      resolved_count:
+        description: "Number of threads resolved"
+        value: ${{ jobs.resolve.outputs.resolved_count }}
+
+jobs:
+  resolve:
+    name: Resolve Outdated Review Threads
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      resolved_count: ${{ steps.resolve.outputs.resolved_count }}
+    steps:
+      - name: Resolve outdated review threads
+        id: resolve
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const prNumber = ${{ inputs.pr_number }};
+
+            const query = `query($owner: String!, $repo: String!, $pr: Int!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $pr) {
+                  reviewThreads(first: 100) {
+                    nodes {
+                      id
+                      isResolved
+                      isOutdated
+                      comments(first: 1) {
+                        nodes {
+                          body
+                          author { login }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }`;
+
+            const result = await github.graphql(query, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pr: prNumber
+            });
+
+            const threads = result.repository.pullRequest.reviewThreads.nodes;
+            const outdatedUnresolved = threads.filter(t => t.isOutdated && !t.isResolved);
+
+            if (outdatedUnresolved.length === 0) {
+              core.info('No outdated unresolved threads found');
+              core.setOutput('resolved_count', 0);
+              return;
+            }
+
+            core.info(`Found ${outdatedUnresolved.length} outdated unresolved thread(s)`);
+
+            let resolvedCount = 0;
+            const errors = [];
+
+            for (const thread of outdatedUnresolved) {
+              try {
+                await github.graphql(`
+                  mutation($threadId: ID!) {
+                    resolveReviewThread(input: {threadId: $threadId}) {
+                      thread { isResolved }
+                    }
+                  }
+                `, { threadId: thread.id });
+
+                resolvedCount++;
+                core.info(`Resolved outdated thread: ${thread.id}`);
+              } catch (error) {
+                errors.push({ id: thread.id, error: error.message });
+                core.warning(`Failed to resolve thread ${thread.id}: ${error.message}`);
+              }
+            }
+
+            if (resolvedCount > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: [
+                  `🔄 **Auto-resolved ${resolvedCount} outdated review thread(s)**`,
+                  '',
+                  'These threads were on code that has since been modified.',
+                  'The original feedback may no longer apply to the current code.',
+                  errors.length > 0 ? `\n⚠️ ${errors.length} thread(s) could not be resolved automatically.` : ''
+                ].filter(Boolean).join('\n')
+              });
+            }
+
+            core.setOutput('resolved_count', resolvedCount);

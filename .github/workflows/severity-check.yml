@@ -1,0 +1,146 @@
+name: Review Thread Severity Check
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Pull request number to check"
+        required: true
+        type: number
+      blocking_levels:
+        description: "Comma-separated severity levels that block CI (default: critical,high)"
+        required: false
+        type: string
+        default: "critical,high"
+      post_comment:
+        description: "Post a PR comment listing blocking threads"
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      blocking_count:
+        description: "Number of blocking (critical/high) unresolved threads"
+        value: ${{ jobs.check.outputs.blocking_count }}
+      total_unresolved:
+        description: "Total number of unresolved threads"
+        value: ${{ jobs.check.outputs.total_unresolved }}
+
+jobs:
+  check:
+    name: Check Review Threads
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    outputs:
+      blocking_count: ${{ steps.categorize.outputs.blocking_count }}
+      total_unresolved: ${{ steps.categorize.outputs.total_unresolved }}
+    steps:
+      - name: Categorize review findings by severity
+        id: categorize
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const SEVERITY_PATTERNS = {
+              critical: [/!\[critical\]/i, /!\[security-critical\]/i, /\*\*critical\*\*/i],
+              high: [/!\[high\]/i, /!\[security-high\]/i, /\*\*high\*\*/i],
+              medium: [/!\[medium\]/i, /\*\*medium\*\*/i],
+              low: [/!\[low\]/i, /\*\*low\*\*/i, /nit:/i, /nitpick:/i, /minor:/i]
+            };
+
+            function categorizeSeverity(body) {
+              const lower = body.toLowerCase();
+              for (const [severity, patterns] of Object.entries(SEVERITY_PATTERNS)) {
+                for (const pattern of patterns) {
+                  if (pattern.test(lower)) return severity;
+                }
+              }
+              return 'low';
+            }
+
+            const prNumber = ${{ inputs.pr_number }};
+            const blockingLevels = '${{ inputs.blocking_levels }}'.split(',').map(s => s.trim());
+            const postComment = ${{ inputs.post_comment }};
+
+            const query = `query($owner: String!, $repo: String!, $pr: Int!) {
+              repository(owner: $owner, name: $repo) {
+                pullRequest(number: $pr) {
+                  reviewThreads(first: 100) {
+                    nodes {
+                      id
+                      isResolved
+                      isOutdated
+                      path
+                      line
+                      comments(first: 1) {
+                        nodes {
+                          body
+                          author { login }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }`;
+
+            const result = await github.graphql(query, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pr: prNumber
+            });
+
+            const threads = result.repository.pullRequest.reviewThreads.nodes;
+
+            if (threads.length >= 100) {
+              core.warning('PR has 100+ review threads — only the first 100 were evaluated.');
+            }
+
+            const unresolved = threads.filter(t => !t.isResolved);
+            const categorized = { critical: [], high: [], medium: [], low: [] };
+
+            for (const thread of unresolved) {
+              const comments = thread.comments?.nodes || [];
+              if (comments.length === 0) continue;
+
+              const body = comments[0].body || '';
+              const severity = categorizeSeverity(body);
+              categorized[severity].push({
+                path: thread.path || 'N/A',
+                line: thread.line,
+                author: comments[0].author?.login || 'unknown'
+              });
+            }
+
+            const blockingCount = blockingLevels.reduce(
+              (sum, level) => sum + (categorized[level]?.length || 0), 0
+            );
+            const totalUnresolved = unresolved.length;
+
+            core.setOutput('blocking_count', blockingCount);
+            core.setOutput('total_unresolved', totalUnresolved);
+
+            console.log(`Findings: critical=${categorized.critical.length}, high=${categorized.high.length}, medium=${categorized.medium.length}, low=${categorized.low.length}`);
+
+            if (blockingCount > 0) {
+              const blockingThreads = blockingLevels.flatMap(level =>
+                (categorized[level] || []).map(t =>
+                  `- **${level}**: \`${t.path}:${t.line}\` (@${t.author})`
+                )
+              );
+
+              if (postComment) {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: `⛔ **CI blocked** — ${blockingCount} ${blockingLevels.join('/')} review thread(s) unresolved.\n\n${blockingThreads.join('\n')}`
+                });
+              }
+
+              core.setFailed(`Found ${blockingCount} blocking severity finding(s): ${blockingLevels.map(l => `${l}=${categorized[l]?.length || 0}`).join(', ')}`);
+            } else if (totalUnresolved > 0) {
+              core.notice(`${totalUnresolved} unresolved thread(s) remaining (non-blocking) — CI proceeding`);
+            } else {
+              console.log('All review threads resolved.');
+            }

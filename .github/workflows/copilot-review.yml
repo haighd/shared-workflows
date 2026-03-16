@@ -1,0 +1,44 @@
+name: Request Copilot Review
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Pull request number"
+        required: true
+        type: number
+    secrets:
+      copilot_review_token:
+        description: "Token with permission to request Copilot reviews"
+        required: true
+
+jobs:
+  request-copilot-review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Request Copilot Code Review
+        env:
+          GH_TOKEN: ${{ secrets.copilot_review_token }}
+          PR_NUM: ${{ inputs.pr_number }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "0" ]; then
+            echo "::warning::No PR number provided, skipping Copilot review request"
+            exit 0
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::copilot_review_token not available (fork PR?), skipping"
+            exit 0
+          fi
+
+          # Request Copilot as a reviewer using the [bot] suffix.
+          # Without [bot], the API returns "not a collaborator".
+          # Ref: https://github.com/ChrisCarini/gh-copilot-review
+          # Ref: https://github.com/cli/cli/issues/10598#issuecomment-2893526162
+          gh api --method POST \
+            "/repos/${GH_REPO}/pulls/${PR_NUM}/requested_reviewers" \
+            -f "reviewers[]=copilot-pull-request-reviewer[bot]" \
+            && echo "Copilot review requested on PR #${PR_NUM}" \
+            || echo "::warning::Failed to request Copilot review (non-fatal)"
