@@ -12,7 +12,7 @@ Reusable GitHub Actions workflows for CI/CD and PR automation. Used by [golden-p
 
 ## Adding to a new project
 
-### 1. Create thin wrapper workflows
+### 1. Create wrapper workflows
 
 Each project needs wrapper workflows that call the shared ones. Create these in `.github/workflows/`:
 
@@ -51,48 +51,63 @@ jobs:
       pr_number: ${{ github.event.pull_request.number }}
 ```
 
-The severity-check workflow is called from within `ci-pipeline.yml` (not as a standalone wrapper):
+The severity-check workflow is called from within your project's `ci.yml`:
 
 ```yaml
 severity-check:
-  needs: gate
+  if: github.event_name == 'pull_request'
   uses: haighd/shared-workflows/.github/workflows/severity-check.yml@68f1c4b # v1.0.1
   with:
-    pr_number: ${{ needs.gate.outputs.pr_number }}
+    pr_number: ${{ github.event.pull_request.number }}
 ```
 
-### 2. Create reviewer config
+### 2. Create your project CI workflow
 
-Create `.github/reviewer-config.yml`:
+Create `.github/workflows/ci.yml` with branch-aware tiering. CI triggers directly on
+`pull_request` events — no labels, no `repository_dispatch`, no review-gate orchestration.
+
+The CI workflow determines the tier based on the PR's target branch:
+
+- **Full tier** (PR targets `main`): all checks including E2E / rehearsals
+- **Light tier** (PR targets `sprint/*` or other): core checks only (lint, typecheck, tests)
+
+Include a final aggregation job named `CI` that evaluates all upstream results:
 
 ```yaml
-required_reviewers:
-  copilot:
-    login: copilot-pull-request-reviewer[bot]
-    completion_mode: explicit
-    done_patterns:
-      - "Pull request overview"
-
-optional_reviewers: {}
-timeout_minutes: 30
+ci:
+  name: CI
+  if: always()
+  needs: [severity-check, lint, typecheck, tests]
+  runs-on: ubuntu-latest
+  steps:
+    - name: Evaluate results
+      run: |
+        for result in "${{ needs.severity-check.result }}" "${{ needs.lint.result }}" "${{ needs.typecheck.result }}" "${{ needs.tests.result }}"; do
+          if [[ "$result" == "failure" ]]; then
+            exit 1
+          fi
+        done
 ```
 
-### 3. Copy project-specific workflows
+### 3. Apply GitHub rulesets
 
-Copy these from an existing project and adapt:
+**Copilot Reviews** (all branches — no deletion block):
 
-- `review-gate.yml` -- manages `ready-for-ci` / `ready-to-merge` labels
-- `ci-pipeline.yml` -- triggered by `repository_dispatch: ci-ready`, runs your test suite
-- `bypass.yml` -- passphrase-protected emergency bypass via `workflow_dispatch`
+```bash
+gh api repos/OWNER/REPO/rulesets --method POST --input - <<'EOF'
+{
+  "name": "Copilot Reviews",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {"ref_name": {"include": ["~ALL"], "exclude": []}},
+  "rules": [
+    {"type": "copilot_code_review", "parameters": {"review_on_push": true, "review_draft_pull_requests": true}}
+  ]
+}
+EOF
+```
 
-### 4. Add secrets
-
-| Secret                 | Purpose                                                                  |
-| ---------------------- | ------------------------------------------------------------------------ |
-| `COPILOT_REVIEW_TOKEN` | Token with `pull-requests: write` for requesting Copilot reviews         |
-| `BYPASS_PASSPHRASE`    | Passphrase for the bypass workflow (human-only, never share with agents) |
-
-### 5. Apply GitHub ruleset
+**main-protection** (main branch only):
 
 ```bash
 gh api repos/OWNER/REPO/rulesets --method POST --input - <<'EOF'
@@ -100,9 +115,7 @@ gh api repos/OWNER/REPO/rulesets --method POST --input - <<'EOF'
   "name": "main-protection",
   "target": "branch",
   "enforcement": "active",
-  "conditions": {
-    "ref_name": { "include": ["refs/heads/main"], "exclude": [] }
-  },
+  "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
   "rules": [
     {"type": "deletion"},
     {"type": "non_fast_forward"},
@@ -110,12 +123,14 @@ gh api repos/OWNER/REPO/rulesets --method POST --input - <<'EOF'
       "dismiss_stale_reviews_on_push": true,
       "require_code_owner_review": false,
       "require_last_push_approval": false,
-      "required_approving_review_count": 1,
-      "required_review_thread_resolution": true
+      "required_approving_review_count": 0,
+      "required_review_thread_resolution": true,
+      "allowed_merge_methods": ["merge", "squash", "rebase"]
     }},
     {"type": "required_status_checks", "parameters": {
       "strict_required_status_checks_policy": false,
-      "required_status_checks": [{"context": "CI Pipeline"}]
+      "do_not_enforce_on_create": false,
+      "required_status_checks": [{"context": "CI / CI", "integration_id": 15368}]
     }}
   ],
   "bypass_actors": [
@@ -126,6 +141,18 @@ EOF
 ```
 
 Get your user ID with `gh api user --jq '.id'`.
+
+### 4. Enable auto-delete head branches
+
+```bash
+gh api repos/OWNER/REPO -X PATCH -f delete_branch_on_merge=true
+```
+
+### 5. Add secrets
+
+| Secret                 | Purpose                                                          |
+| ---------------------- | ---------------------------------------------------------------- |
+| `COPILOT_REVIEW_TOKEN` | Token with `pull-requests: write` for requesting Copilot reviews |
 
 ## Pinning
 
@@ -140,19 +167,16 @@ After updating shared-workflows, bump the SHA in each consumer project.
 ## PR lifecycle
 
 ```
-PR opened
-  -> Copilot requested as reviewer
-  -> ready-for-ci and ready-to-merge labels stripped
+PR opened / pushed
+  -> Copilot requested as reviewer (copilot-review.yml)
+  -> CI runs automatically (ci.yml, branch-aware tiering)
+  -> Auto-resolve outdated threads (auto-resolve-outdated.yml)
 
-Bot reviews complete + 0 unresolved threads
-  -> ready-for-ci label added
-  -> ci-ready repository_dispatch event fired
+Developer addresses Copilot feedback
+  -> Pushes fixes -> CI re-runs, Copilot re-reviews
 
-CI pipeline runs automatically
-  -> severity check -> lightweight CI -> full tests
-  -> post-CI thread re-check (race window protection)
-  -> ready-to-merge label added
-
-Merge
-  -> Ruleset enforces: 1 approval + CI Pipeline passing + 0 unresolved threads
+Merge requirements (GitHub ruleset on main):
+  -> CI / CI status check passes
+  -> All review threads resolved
+  -> No force push, no branch deletion on main
 ```
